@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Tactical RMM Script: Forensic Check - PHP2Shell (CVE-2026-109618 / 109619)
+# Supported: Debian/Ubuntu Baremetal/LXC, Docker (Mailcow, Nextcloud, ISPConfig)
+# ==============================================================================
+
+set -u
+
+ALERT_FOUND=0
+SCAN_DAYS=5
+
+log_ok() {
+    echo "[OK] $1"
+}
+
+log_warn() {
+    echo "[WARN] $1"
+}
+
+log_crit() {
+    echo "[CRITICAL] $1"
+    ALERT_FOUND=1
+}
+
+echo "=== Tactical RMM: PHP2Shell Forensic Scan ==="
+echo "Host: $(hostname -f 2>/dev/null || hostname) | Date: $(date -u)"
+echo "------------------------------------------------------------"
+
+# 1. Native & Persistent Session File Inspection
+echo -e "\n[*] 1. Session Storage & Injection Scan..."
+SESSION_DIRS="/var/lib/php/sessions /tmp /var/tmp"
+
+if [ -d "/var/lib/docker/volumes" ]; then
+    DOCKER_SESS_VOLS=$(find /var/lib/docker/volumes -type d -name "_data" 2>/dev/null | grep -E "(session|php)" || true)
+    SESSION_DIRS="$SESSION_DIRS $DOCKER_SESS_VOLS"
+fi
+
+FOUND_SESS_INJ=0
+for sdir in $SESSION_DIRS; do
+    if [ -d "$sdir" ]; then
+        SUSPICIOUS_SESS=$(grep -Erl "(<\?php|<\?=|[Oa]:[0-9]+:\"|upload_progress)" "$sdir" 2>/dev/null || true)
+        if [ -n "$SUSPICIOUS_SESS" ]; then
+            log_crit "Verdächtige Session-Injections in $sdir gefunden:"
+            echo "$SUSPICIOUS_SESS" | head -n 10
+            FOUND_SESS_INJ=1
+        fi
+    fi
+done
+[ "$FOUND_SESS_INJ" -eq 0 ] && log_ok "Keine PHP-Tags oder Exploit-Payloads in Sessions gefunden."
+
+# 2. Filesystem & Web-Root Checks (Webshells & Temp-Executables)
+echo -e "\n[*] 2. Dateisystem-Prüfung auf modifizierte PHP-Dateien & Executables..."
+SEARCH_ROOTS=""
+# Piler: gezielt /var/piler/www ansprechen, nie das gesamte /var/piler inkl. /store
+for p in /var/www /home /var/piler/www /opt/mailcow-dockerized/data/web; do
+    [ -d "$p" ] && SEARCH_ROOTS="$SEARCH_ROOTS $p"
+done
+
+if [ -n "$SEARCH_ROOTS" ]; then
+    # Prunt Mailstore- und Cache-Verzeichnisse für minimale I/O-Laufzeit
+    RECENT_PHP=$(find $SEARCH_ROOTS \
+        -type d \( -name "store" -o -name "cache" \) -prune -o \
+        -maxdepth 6 -type f \( -name "*.php" -o -name "*.phtml" -o -name "*.phar" \) -mtime -$SCAN_DAYS -print 2>/dev/null | \
+        grep -Ev "(templates/cache/|/nextcloud/apps/)" || true)
+    
+    if [ -n "$RECENT_PHP" ]; then
+        log_warn "Kürzlich geänderte PHP-Dateien außerhalb von Caches/Apps (letzte $SCAN_DAYS Tage):"
+        echo "$RECENT_PHP" | head -n 15
+    else
+        log_ok "Keine auffällig modifizierten PHP-Dateien in Web-Roots."
+    fi
+fi
+
+SUSP_BINARIES=$(find /tmp /dev/shm /var/tmp -type f \( -perm -111 -o -name "*.so" -o -name "*.sh" -o -name "*.py" \) 2>/dev/null || true)
+if [ -n "$SUSP_BINARIES" ]; then
+    log_crit "Ausführbare Dateien oder Skripte in /tmp oder /dev/shm entdeckt:"
+    echo "$SUSP_BINARIES" | head -n 15
+else
+    log_ok "Keine Binaries/Skripte in /tmp und /dev/shm gefunden."
+fi
+
+# 3. Prozessüberwachung (Whitelisted: olefy.py, whitelist_forwardinghosts.sh, notify_push)
+echo -e "\n[*] 3. Prozessbaum-Prüfung (Web-User Subprozesse)..."
+SUSP_PROCS=$(ps -eo user,pid,ppid,args 2>/dev/null | \
+    grep -E "^(www-data|nginx|nobody|web[0-9]+|clp)\s+" | \
+    grep -E "(sh|bash|curl|wget|nc|ncat|netcat|python|perl|socat|notify_push)" | \
+    grep -v grep | \
+    grep -Ev "(olefy\.py|whitelist_forwardinghosts\.sh|apps/notify_push/bin)" || true)
+
+if [ -n "$SUSP_PROCS" ]; then
+    log_crit "Verdächtige Subprozesse unter Web-Usern aktiv:"
+    echo "$SUSP_PROCS"
+else
+    log_ok "Keine verdächtigen interaktiven Shells oder Downloader unter Web-Usern."
+fi
+
+# 4. Logfile-Analyse (Host & Docker Persistent Volumes)
+echo -e "\n[*] 4. Analyse von Access- & Error-Logs..."
+LOG_SOURCES=""
+[ -d "/var/log" ] && LOG_SOURCES="/var/log"
+
+MC_VOL=$(find /var/lib/docker/volumes -type d -name "_data" 2>/dev/null | grep "nginx-log-vol-1" | head -n 1 || true)
+[ -n "$MC_VOL" ] && LOG_SOURCES="$LOG_SOURCES $MC_VOL"
+
+CRASH_LOGS=$(grep -Eri "(allowed memory size.*exhausted|child.*terminated on signal|segmentation fault)" $LOG_SOURCES 2>/dev/null | tail -n 10 || true)
+if [ -n "$CRASH_LOGS" ]; then
+    log_warn "Mögliche Crash- oder Memory-Exhaustion-Spuren in den Logs:"
+    echo "$CRASH_LOGS"
+else
+    log_ok "Keine auffälligen FPM-Worker-Crashes oder OOM-Meldungen."
+fi
+
+HIGH_POST_IPS=$(find $LOG_SOURCES -type f -name "*access*.log" -exec tail -n 50000 {} + 2>/dev/null | \
+    awk '$6 ~ /POST/ && $7 ~ /\.php/ {print $1}' | \
+    sort | uniq -c | awk '$1 > 300 {print $1 " Anfragen von IP: " $2}' || true)
+
+if [ -n "$HIGH_POST_IPS" ]; then
+    log_crit "Potenzieller Brute-Force / Exploit-Scan entdeckt (>300 POSTs auf .php):"
+    echo "$HIGH_POST_IPS"
+else
+    log_ok "Keine auffälligen POST-Anfragefluten auf PHP-Endpunkte verzeichnet."
+fi
+
+# 5. Docker Container Diff (Whitelisted: Mailcow Startup-Artefakte, Asset-Caches, Dovecot tmp)
+if command -v docker >/dev/null 2>&1; then
+    echo -e "\n[*] 5. Docker Container Rootfs Diffs..."
+    PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo)" || true)
+    
+    for c in $PHP_CONTAINERS; do
+        DIFF_CHECK=$(docker diff "$c" 2>/dev/null | \
+            grep -E "^[AC] .*(bin/|tmp/|shm/|\.php$|\.sh$|\.so$)" | \
+            grep -Ev "(supervisor.*\.log|healthcheck_status|mailcowauth|redis-conf\.sh|source_env\.sh|init_db\.inc\.php|cjson\.so|optimize-fts\.sh|imapsync_runner\.pl|maildir_gc\.sh|postdrop|postqueue|postlog|libpostfix|\.css$|\.js$|uid_[0-9]+)" | \
+            head -n 5 || true)
+            
+        if [ -n "$DIFF_CHECK" ]; then
+            log_crit "Verdächtige RootFS-Änderungen in Container [$c]:"
+            echo "$DIFF_CHECK"
+        fi
+    done
+fi
+
+# ==============================================================================
+# Tactical RMM Exit Code Handling
+# ==============================================================================
+echo -e "\n------------------------------------------------------------"
+if [ "$ALERT_FOUND" -ne 0 ]; then
+    echo "STATUS: CRITICAL - Potenzielle Exploit-Spuren oder Artefakte gefunden!"
+    exit 1
+else
+    echo "STATUS: OK - Keine akuten Indikatoren für PHP2Shell gefunden."
+    exit 0
+fi

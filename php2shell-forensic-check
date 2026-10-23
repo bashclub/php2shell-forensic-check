@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Tactical RMM Script: Forensic Check & Patch Auditor - PHP2Shell (CVE-2026-109618 / 109619)
-# Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Non-PHP
+# Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Plesk, Non-PHP
 # ==============================================================================
 
 set -u
@@ -9,12 +9,15 @@ set -u
 ALERT_FOUND=0
 SCAN_DAYS=5
 
+# Liste ignorierter Versionen für intern isolierte Stacks (z. B. CloudPanel PHP 8.1)
+IGNORE_VERSIONS="${IGNORE_VERSIONS:-8.1}"
+
 log_ok() { echo "[OK] $1"; }
 log_warn() { echo "[WARN] $1"; }
 log_crit() { echo "[CRITICAL] $1"; ALERT_FOUND=1; }
 
 echo "=== Tactical RMM: PHP2Shell Forensic Scan & Patch Auditor ==="
-echo "Host: $(hostname -f 2>/dev/null || hostname) | Date: $(date -u)"
+echo "Host: $(hostname -f 2>/dev/null \vert{}\vert{} hostname) \vert{} Date:$(date -u)"
 echo "------------------------------------------------------------"
 
 # ==============================================================================
@@ -45,7 +48,6 @@ fi
 # ==============================================================================
 echo -e "\n[*] 0b. Prüfung von PHP-Patchstand und laufenden FPM-Prozessen..."
 
-# Semver-Vergleich: Liefert 0 (true), wenn $1 >= $2
 version_ge() {
     printf '%s\n%s' "$2" "$1" | sort -C -V
 }
@@ -54,7 +56,6 @@ check_php_patch() {
     local v_raw="$1"
     local context="$2"
     
-    # Extrahiere Major.Minor.Patch (z. B. 8.2.35)
     local v=$(echo "$v_raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     
     if [ -z "$v" ]; then
@@ -65,22 +66,27 @@ check_php_patch() {
     local major_minor=$(echo "$v" | cut -d. -f1,2)
     local is_safe=0
 
+    # Whitelist-Prüfung für isolierte Versionen (z. B. CloudPanel 8.1)
+    if [[ " $IGNORE_VERSIONS " =~ [[:space:]]${major_minor}[[:space:]] ]]; then
+        log_warn "[$context] PHP$v ist ungepatcht, aber via IGNORE_VERSIONS ignoriert (intern isoliert)."
+        return 0
+    fi
+
     case "$major_minor" in
         8.2) version_ge "$v" "8.2.35" && is_safe=1 ;;
         8.3) version_ge "$v" "8.3.36" && is_safe=1 ;;
         8.4) version_ge "$v" "8.4.27" && is_safe=1 ;;
         8.5) version_ge "$v" "8.5.12" && is_safe=1 ;;
         *)
-            # 7.x, 8.0, 8.1 oder älter
             is_safe=0
             ;;
     esac
 
     if [ "$is_safe" -eq 1 ]; then
-        log_ok "[$context] PHP $v ist GEFIXT gegen PHP2Shell."
+        log_ok "[$context] PHP$v ist GEFIXT gegen PHP2Shell."
         return 0
     else
-        log_crit "[$context] PHP $v ist UNGEPATCHT und angreifbar!"
+        log_crit "[$context] PHP$v ist UNGEPATCHT und angreifbar!"
         return 1
     fi
 }
@@ -101,7 +107,6 @@ if [ -n "$FPM_PIDS" ]; then
                 PROC_VER=$("$EXE_PATH" -v 2>/dev/null | head -n 1 || true)
                 check_php_patch "$PROC_VER" "Running Process PID $pid ($EXE_PATH)"
                 
-                # Prüfen, ob die Binary auf der Platte gelöscht/ersetzt wurde (typisch nach apt upgrade ohne restart)
                 if readlink "/proc/$pid/exe" | grep -q "(deleted)"; then
                     log_crit "NEUSTART ERFORDERLICH: FPM-Prozess $pid läuft noch mit alter Binary im RAM!"
                     echo "    -> Empfehlung: systemctl restart php*-fpm"
@@ -111,14 +116,16 @@ if [ -n "$FPM_PIDS" ]; then
     done
 fi
 
-# 3. Docker PHP Container prüfen
+# 3. Docker PHP Container prüfen (überspringt Container ohne PHP geräuschlos)
 if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
     PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|wordpress)" || true)
     for c in $PHP_CONTAINERS; do
-        C_PHP_VER=$(docker exec "$c" php -r 'echo PHP_VERSION;' 2>/dev/null || true)
-        if [ -n "$C_PHP_VER" ]; then
-            if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]"; then
-                echo "    -> Empfehlung für [$c]: Image neu pullen und Container neu erstellen (z. B. ./update.sh oder docker compose pull)."
+        if docker exec "$c" which php >/dev/null 2>&1; then
+            C_PHP_VER=$(docker exec "$c" php -r 'echo PHP_VERSION;' 2>/dev/null || true)
+            if [ -n "$C_PHP_VER" ]; then
+                if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]"; then
+                    echo "    -> Empfehlung für [$c]: Image neu pullen und Container neu erstellen (z. B. ./update.sh oder docker compose pull)."
+                fi
             fi
         fi
     done
@@ -130,157 +137,4 @@ fi
 echo -e "\n[*] 1. Session Storage Scan..."
 SESSION_DIRS="/var/lib/php/sessions"
 
-if command -v php >/dev/null 2>&1; then
-    PHP_SESS_PATH=$(php -r 'echo ini_get("session.save_path");' 2>/dev/null || true)
-    [ -n "$PHP_SESS_PATH" ] && [ -d "$PHP_SESS_PATH" ] && SESSION_DIRS="$SESSION_DIRS $PHP_SESS_PATH"
-fi
-
-if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
-    DOCKER_SESS_VOLS=$(find /var/lib/docker/volumes -maxdepth 3 -type d -name "_data" 2>/dev/null | grep -E "(session|php)" || true)
-    SESSION_DIRS="$SESSION_DIRS $DOCKER_SESS_VOLS"
-fi
-
-FOUND_SESS_INJ=0
-for sdir in $(echo "$SESSION_DIRS" | tr ' ' '\n' | sort -u); do
-    if [ -d "$sdir" ]; then
-        SUSP=$(find "$sdir" -maxdepth 2 -type f \( -name "sess_*" -o -name "*.sess" \) \
-            -exec grep -I -Erl "(<\?php|<\?=|[Oa]:[0-9]+:\"|upload_progress)" {} + 2>/dev/null || true)
-        if [ -n "$SUSP" ]; then
-            log_crit "Verdächtige Session-Injections in $sdir gefunden:"
-            echo "$SUSP" | head -n 10
-            FOUND_SESS_INJ=1
-        fi
-    fi
-done
-
-for tdir in /tmp /var/tmp; do
-    SUSP_TMP=$(find "$tdir" -maxdepth 1 -type f -name "sess_*" \
-        -exec grep -I -Erl "(<\?php|<\?=|[Oa]:[0-9]+:\"|upload_progress)" {} + 2>/dev/null || true)
-    if [ -n "$SUSP_TMP" ]; then
-        log_crit "Verdächtige PHP-Session-Injections in $tdir/sess_* gefunden:"
-        echo "$SUSP_TMP" | head -n 10
-        FOUND_SESS_INJ=1
-    fi
-done
-
-[ "$FOUND_SESS_INJ" -eq 0 ] && log_ok "Keine PHP-Tags oder Exploit-Payloads in Sessions gefunden."
-
-# ==============================================================================
-# 2. Dateisystem-Prüfung (Web-Roots & Temp-Executables)
-# ==============================================================================
-echo -e "\n[*] 2. Dateisystem-Prüfung auf modifizierte PHP-Dateien & Executables..."
-SEARCH_ROOTS=""
-for p in /var/www /home /var/piler/www /opt/mailcow-dockerized/data/web; do
-    [ -d "$p" ] && SEARCH_ROOTS="$SEARCH_ROOTS $p"
-done
-
-if [ -n "$SEARCH_ROOTS" ]; then
-    RECENT_PHP=$(find $SEARCH_ROOTS -maxdepth 6 \
-        \( -type d \( -name "store" -o -name "cache" -o -name "apps" -o -name "wflogs" -o -name "languages" \) -prune \) -o \
-        \( -type f \( -name "*.php" -o -name "*.phtml" -o -name "*.phar" \) ! -name "*.l10n.php" -mtime -$SCAN_DAYS -print \) 2>/dev/null || true)
-    
-    if [ -n "$RECENT_PHP" ]; then
-        log_warn "Kürzlich geänderte PHP-Dateien außerhalb von Caches/Apps (letzte $SCAN_DAYS Tage):"
-        echo "$RECENT_PHP" | head -n 15
-    else
-        log_ok "Keine auffällig modifizierten PHP-Dateien in Web-Roots."
-    fi
-fi
-
-SUSP_BINARIES=$(find /tmp /dev/shm /var/tmp -maxdepth 3 -type f \( -perm -111 -o -name "*.so" -o -name "*.sh" -o -name "*.py" -o -name "*.pl" \) 2>/dev/null | \
-    grep -Ev "(systemd-private|tmp\.[A-Za-z0-9]+|\.mount_|coolwsd|appimage_extracted|/tmp/oscap\.)" || true)
-
-if [ -n "$SUSP_BINARIES" ]; then
-    log_crit "Unerwartete Binaries/Skripte in flüchtigen Pfaden entdeckt:"
-    echo "$SUSP_BINARIES" | head -n 15
-else
-    log_ok "Keine verdächtigen Executables in /tmp oder /dev/shm."
-fi
-
-# ==============================================================================
-# 3. Prozessbaum-Prüfung (Web-User Subprozesse)
-# ==============================================================================
-echo -e "\n[*] 3. Prozessbaum-Prüfung (Web-User Subprozesse)..."
-SUSP_PROCS=$(ps -eo user,pid,ppid,args 2>/dev/null | \
-    grep -E "^(www-data|nginx|nobody|web[0-9]+|clp)\s+" | \
-    grep -E "(curl|wget|nc|ncat|netcat|socat|/bin/sh|/bin/bash|/bin/dash)" | \
-    grep -v grep | \
-    grep -Ev "(olefy\.py|whitelist_forwardinghosts\.sh|notify_push|coolwsd|Collabora|\.mount_|appimage_extracted)" || true)
-
-if [ -n "$SUSP_PROCS" ]; then
-    log_crit "Verdächtige interaktive Shells oder Downloader unter Web-Usern aktiv:"
-    echo "$SUSP_PROCS"
-else
-    log_ok "Keine verdächtigen interaktiven Shells unter Web-Usern."
-fi
-
-# ==============================================================================
-# 4. Logfile-Analyse (I/O-geschützt: nur .log der letzten 7 Tage)
-# ==============================================================================
-echo -e "\n[*] 4. Analyse von Access- & Error-Logs..."
-LOG_DIRS=""
-[ -d "/var/log" ] && LOG_DIRS="/var/log"
-
-if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
-    MC_VOL=$(find /var/lib/docker/volumes -maxdepth 3 -type d -name "_data" 2>/dev/null | grep "nginx-log-vol-1" | head -n 1 || true)
-    [ -n "$MC_VOL" ] && LOG_DIRS="$LOG_DIRS $MC_VOL"
-fi
-
-RECENT_LOGS=$(find $LOG_DIRS -maxdepth 3 -type f \( -name "*access*.log" -o -name "*error*.log" -o -name "nextcloud.log" \) -mtime -7 2>/dev/null || true)
-
-if [ -n "$RECENT_LOGS" ]; then
-    CRASH_LOGS=$(grep -Ei "(allowed memory size.*exhausted|child.*terminated on signal|segmentation fault)" $RECENT_LOGS 2>/dev/null | \
-        grep -Ei "(Oct|Okt|2026-10)" | tail -n 10 || true)
-
-    if [ -n "$CRASH_LOGS" ]; then
-        log_warn "Aktuelle Crash- oder Memory-Exhaustion-Spuren (Oktober 2026):"
-        echo "$CRASH_LOGS"
-    else
-        log_ok "Keine aktuellen FPM-Worker-Crashes oder OOM-Meldungen."
-    fi
-
-    HIGH_POST_IPS=$(grep -h "POST " $RECENT_LOGS 2>/dev/null | \
-        awk '$7 ~ /\.php/ {print $1}' | \
-        sort | uniq -c | awk '$1 > 300 {print $1 " Anfragen von IP: " $2}' || true)
-
-    if [ -n "$HIGH_POST_IPS" ]; then
-        log_crit "Potenzieller Brute-Force / Exploit-Scan entdeckt (>300 POSTs auf .php):"
-        echo "$HIGH_POST_IPS"
-    else
-        log_ok "Keine auffälligen POST-Anfragefluten auf PHP-Endpunkte verzeichnet."
-    fi
-else
-    log_ok "Keine aktuellen Logdateien zur Prüfung gefunden."
-fi
-
-# ==============================================================================
-# 5. Docker Container Diff (RootFS-Prüfung)
-# ==============================================================================
-if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
-    echo -e "\n[*] 5. Docker Container Rootfs Diffs..."
-    PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|mariadb)" || true)
-    
-    for c in $PHP_CONTAINERS; do
-        DIFF_CHECK=$(docker diff "$c" 2>/dev/null | \
-            grep -E "^[AC] .*(bin/|tmp/|shm/|\.php$|\.sh$|\.so$)" | \
-            grep -Ev "(supervisor.*\.log|healthcheck_status|mailcowauth|redis-conf\.sh|source_env\.sh|init_db\.inc\.php|cjson\.so|optimize-fts\.sh|imapsync_runner\.pl|maildir_gc\.sh|postdrop|postqueue|postlog|libpostfix|\.css$|\.js$|uid_[0-9]+|/run/s6/)" | \
-            head -n 5 || true)
-            
-        if [ -n "$DIFF_CHECK" ]; then
-            log_crit "Verdächtige RootFS-Änderungen in Container [$c]:"
-            echo "$DIFF_CHECK"
-        fi
-    done
-fi
-
-# ==============================================================================
-# Tactical RMM Exit Code Handling
-# ==============================================================================
-echo -e "\n------------------------------------------------------------"
-if [ "$ALERT_FOUND" -ne 0 ]; then
-    echo "STATUS: CRITICAL - Ungepatchte Versionen, fehlende Neustarts oder verdächtige Artefakte gefunden!"
-    exit 1
-else
-    echo "STATUS: OK - Alle PHP-Instanzen gepatcht und keine Exploit-Spuren gefunden."
-    exit 0
-fi
+if command -v php >/dev

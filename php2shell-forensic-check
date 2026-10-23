@@ -3,6 +3,7 @@
 # Tactical RMM Script: Forensic Check, Patch Auditor & Actionable Hardening
 # PHP2Shell (CVE-2026-109618 / 109619)
 # Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Plesk, Moodle
+# Supports: Upstream Releases (8.2-8.5) & Sury Backports (7.4, 8.0, 8.1 >= 20261021)
 # ==============================================================================
 
 set -u
@@ -10,10 +11,9 @@ set -u
 ALERT_FOUND=0
 SCAN_DAYS=5
 
-# Liste ignorierter Versionen für intern isolierte Stacks (z. B. CloudPanel PHP 8.1)
-IGNORE_VERSIONS="${IGNORE_VERSIONS:-8.1}"
+# Liste ignorierter Versionen für dauerhaft isolierte Stacks
+IGNORE_VERSIONS="${IGNORE_VERSIONS:-}"
 
-# Puffer für das Abschluss-Audit
 RECOMMENDATIONS=()
 
 add_rec() {
@@ -59,6 +59,39 @@ echo -e "\n[*] 0b. Prüfung von PHP-Patchstand, laufenden Prozessen & Härtung..
 
 version_ge() {
     printf '%s\n%s' "$2" "$1" | sort -C -V
+}
+
+# Prüft, ob ein Sury-Paket oder Build-Timestamp einen Security-Backport (>= 21.10.2026) enthält
+check_sury_backport() {
+    local full_v_output="$1"
+    local bin_path="$2"
+
+    # 1. Prüfe Paketversion via dpkg (falls Host-Binary)
+    if command -v dpkg-query >/dev/null 2>&1 && [ -x "$bin_path" ]; then
+        local deb_ver
+        deb_ver=$(dpkg-query -S "$bin_path" 2>/dev/null | awk '{print $1}' | tr -d ':' | xargs -r dpkg-query -W -f='${Version}' 2>/dev/null || true)
+        if echo "$deb_ver" | grep -qE "(deb\.sury\.org|~[0-9]{8})"; then
+            local build_date
+            build_date=$(echo "$deb_ver" | grep -oE '[0-9]{8}' | head -n 1)
+            if [ -n "$build_date" ] && [ "$build_date" -ge 20261021 ]; then
+                return 0
+            fi
+        fi
+    fi
+
+    # 2. Fallback: Parse Build-Datum direkt aus 'php -v'
+    if echo "$full_v_output" | grep -qiE "(built:.*Oct (2[1-9]|3[01]) 2026|built:.*(Nov|Dec) 2026)"; then
+        return 0
+    fi
+
+    # 3. Sury Timestamp direkt im String (z. B. ~20261021)
+    local raw_date
+    raw_date=$(echo "$full_v_output" | grep -oE '~[0-9]{8}' | tr -d '~' | head -n 1)
+    if [ -n "$raw_date" ] && [ "$raw_date" -ge 20261021 ]; then
+        return 0
+    fi
+
+    return 1
 }
 
 audit_php_hardening() {
@@ -115,6 +148,7 @@ check_php_patch() {
     local v_raw="$1"
     local context="$2"
     local exec_cmd="${3:-php}"
+    local bin_path="${4:-}"
     
     local v=$(echo "$v_raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     
@@ -125,8 +159,10 @@ check_php_patch() {
 
     local major_minor=$(echo "$v" | cut -d. -f1,2)
     local is_safe=0
+    local is_sury_backport=0
 
-    if [[ " $IGNORE_VERSIONS " =~ [[:space:]]${major_minor}[[:space:]] ]]; then
+    # Whitelist-Prüfung für manuell ignorierte Versionen
+    if [ -n "$IGNORE_VERSIONS" ] && [[ " $IGNORE_VERSIONS " =~ [[:space:]]${major_minor}[[:space:]] ]]; then
         log_warn "[$context] PHP $v ist ungepatcht, aber via IGNORE_VERSIONS ignoriert (intern isoliert)."
         audit_php_hardening "$exec_cmd" "$major_minor" 0 "$context"
         return 0
@@ -137,27 +173,41 @@ check_php_patch() {
         8.3) version_ge "$v" "8.3.36" && is_safe=1 ;;
         8.4) version_ge "$v" "8.4.27" && is_safe=1 ;;
         8.5) version_ge "$v" "8.5.12" && is_safe=1 ;;
+        7.4|8.0|8.1)
+            # EOL-Zweige: Prüfen, ob Sury-Sicherheitsbackport (Build >= 20261021) vorliegt
+            if check_sury_backport "$v_raw" "$bin_path"; then
+                is_safe=1
+                is_sury_backport=1
+            else
+                is_safe=0
+            fi
+            ;;
         *)
             is_safe=0
             ;;
     esac
 
     if [ "$is_safe" -eq 1 ]; then
-        log_ok "[$context] PHP $v ist GEFIXT gegen PHP2Shell."
+        if [ "$is_sury_backport" -eq 1 ]; then
+            log_ok "[$context] PHP $v (EOL) ist via Sury Security-Backport (>= 20261021) GEFIXT."
+        else
+            log_ok "[$context] PHP $v ist GEFIXT gegen PHP2Shell."
+        fi
         audit_php_hardening "$exec_cmd" "$major_minor" 1 "$context"
         return 0
     else
         log_crit "[$context] PHP $v ist UNGEPATCHT und angreifbar!"
         audit_php_hardening "$exec_cmd" "$major_minor" 0 "$context"
-        add_rec "[UPDATE] $context: PHP-Paket umgehend aktualisieren (Ziel: 8.2.35+, 8.3.36+, 8.4.27+, 8.5.12+)."
+        add_rec "[UPDATE] $context: Auf gepatchte Version bringen (Upstream >= 8.2.35 oder Sury-Backport >= 20261021 einspielen)."
         return 1
     fi
 }
 
 # 1. Host PHP CLI & Binaries prüfen
 if command -v php >/dev/null 2>&1; then
-    HOST_PHP_VER=$(php -r 'echo PHP_VERSION;' 2>/dev/null || php -v | head -n1)
-    check_php_patch "$HOST_PHP_VER" "Host CLI Binary" "php"
+    HOST_PHP_VER=$(php -v 2>/dev/null | head -n 2)
+    HOST_BIN=$(command -v php)
+    check_php_patch "$HOST_PHP_VER" "Host CLI Binary" "php" "$HOST_BIN"
 fi
 
 # 2. Laufende FPM-Master-/Worker-Prozesse im RAM analysieren
@@ -167,8 +217,8 @@ if [ -n "$FPM_PIDS" ]; then
         if [ -e "/proc/$pid/exe" ]; then
             EXE_PATH=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
             if [ -n "$EXE_PATH" ] && [ -x "$EXE_PATH" ]; then
-                PROC_VER=$("$EXE_PATH" -v 2>/dev/null | head -n 1 || true)
-                check_php_patch "$PROC_VER" "Running Process PID $pid ($EXE_PATH)" "$EXE_PATH"
+                PROC_VER=$("$EXE_PATH" -v 2>/dev/null | head -n 2 || true)
+                check_php_patch "$PROC_VER" "Running Process PID $pid ($EXE_PATH)" "$EXE_PATH" "$EXE_PATH"
                 
                 if readlink "/proc/$pid/exe" | grep -q "(deleted)"; then
                     log_crit "NEUSTART ERFORDERLICH: FPM-Prozess $pid läuft noch mit alter Binary im RAM!"
@@ -184,9 +234,9 @@ if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
     PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|wordpress)" || true)
     for c in $PHP_CONTAINERS; do
         if docker exec "$c" which php >/dev/null 2>&1; then
-            C_PHP_VER=$(docker exec "$c" php -r 'echo PHP_VERSION;' 2>/dev/null || true)
+            C_PHP_VER=$(docker exec "$c" php -v 2>/dev/null | head -n 2 || true)
             if [ -n "$C_PHP_VER" ]; then
-                if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]" "docker exec $c php"; then
+                if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]" "docker exec $c php" ""; then
                     add_rec "[DOCKER UPDATE] Container [$c] aktualisieren: 'docker compose pull $c && docker compose up -d $c' bzw. './update.sh'."
                 fi
             fi
@@ -260,7 +310,6 @@ if [ -n "$SEARCH_ROOTS" ]; then
     fi
 fi
 
-# Whitelist: Collabora, OpenSCAP, Systemd PrivateTmp, Plesk/APT GPG-Update-Hooks (/tmp/apt-key-gpghome.*)
 SUSP_BINARIES=$(find /tmp /dev/shm /var/tmp -maxdepth 3 -type f \( -perm -111 -o -name "*.so" -o -name "*.sh" -o -name "*.py" -o -name "*.pl" \) 2>/dev/null | \
     grep -Ev "(systemd-private|tmp\.[A-Za-z0-9]+|\.mount_|coolwsd|appimage_extracted|/tmp/oscap\.|/tmp/apt-key-gpghome\.)" || true)
 

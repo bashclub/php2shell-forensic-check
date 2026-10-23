@@ -2,7 +2,7 @@
 # ==============================================================================
 # Tactical RMM Script: Forensic Check, Patch Auditor & Actionable Hardening
 # PHP2Shell (CVE-2026-109618 / 109619)
-# Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Plesk, Moodle
+# Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Plesk, Moodle, Matomo
 # Supports: Upstream Releases (8.2-8.5) & Sury Backports (7.4, 8.0, 8.1 >= 20261021)
 # ==============================================================================
 
@@ -11,9 +11,7 @@ set -u
 ALERT_FOUND=0
 SCAN_DAYS=5
 
-# Liste ignorierter Versionen für dauerhaft isolierte Stacks
 IGNORE_VERSIONS="${IGNORE_VERSIONS:-}"
-
 RECOMMENDATIONS=()
 
 add_rec() {
@@ -45,7 +43,7 @@ if command -v docker >/dev/null 2>&1; then
     fi
 fi
 
-if [ "$HAS_PHP_HOST" -eq 0 ] && [ "$HAS_PHP_DOCKER" -eq 0 ]; then
+if [[ "$HAS_PHP_HOST" -eq 0 && "$HAS_PHP_DOCKER" -eq 0 ]]; then
     log_ok "Keine PHP-Runtime (weder Host noch Docker-Container) aktiv."
     echo "------------------------------------------------------------"
     echo "STATUS: OK - Non-PHP Host."
@@ -61,33 +59,29 @@ version_ge() {
     printf '%s\n%s' "$2" "$1" | sort -C -V
 }
 
-# Prüft, ob ein Sury-Paket oder Build-Timestamp einen Security-Backport (>= 21.10.2026) enthält
 check_sury_backport() {
     local full_v_output="$1"
     local bin_path="$2"
 
-    # 1. Prüfe Paketversion via dpkg (falls Host-Binary)
-    if command -v dpkg-query >/dev/null 2>&1 && [ -x "$bin_path" ]; then
+    if command -v dpkg-query >/dev/null 2>&1 && [[ -x "$bin_path" ]]; then
         local deb_ver
         deb_ver=$(dpkg-query -S "$bin_path" 2>/dev/null | awk '{print $1}' | tr -d ':' | xargs -r dpkg-query -W -f='${Version}' 2>/dev/null || true)
         if echo "$deb_ver" | grep -qE "(deb\.sury\.org|~[0-9]{8})"; then
             local build_date
             build_date=$(echo "$deb_ver" | grep -oE '[0-9]{8}' | head -n 1)
-            if [ -n "$build_date" ] && [ "$build_date" -ge 20261021 ]; then
+            if [[ -n "$build_date" && "$build_date" -ge 20261021 ]]; then
                 return 0
             fi
         fi
     fi
 
-    # 2. Fallback: Parse Build-Datum direkt aus 'php -v'
     if echo "$full_v_output" | grep -qiE "(built:.*Oct (2[1-9]|3[01]) 2026|built:.*(Nov|Dec) 2026)"; then
         return 0
     fi
 
-    # 3. Sury Timestamp direkt im String (z. B. ~20261021)
     local raw_date
     raw_date=$(echo "$full_v_output" | grep -oE '~[0-9]{8}' | tr -d '~' | head -n 1)
-    if [ -n "$raw_date" ] && [ "$raw_date" -ge 20261021 ]; then
+    if [[ -n "$raw_date" && "$raw_date" -ge 20261021 ]]; then
         return 0
     fi
 
@@ -100,6 +94,16 @@ audit_php_hardening() {
     local is_patched="$3"
     local target_desc="$4"
 
+    if echo "$exec_cmd" | grep -q "php-fpm"; then
+        local cli_candidate
+        cli_candidate=$(echo "$exec_cmd" | sed 's/php-fpm/php/')
+        if command -v "$cli_candidate" >/dev/null 2>&1; then
+            exec_cmd="$cli_candidate"
+        elif command -v php >/dev/null 2>&1; then
+            exec_cmd="php"
+        fi
+    fi
+
     local up_enabled
     local mem_limit
     local post_max
@@ -110,10 +114,10 @@ audit_php_hardening() {
 
     echo "    --- Aktive Härtungswerte (${major_minor}) ---"
     
-    if [ "$up_enabled" = "0" ] || [ "$up_enabled" = "" ]; then
+    if [[ "$up_enabled" == "0" || "$up_enabled" == "" ]]; then
         echo "    [+] session.upload_progress.enabled = Off (CVE-2026-109619 Pfad blockiert)"
     else
-        if [ "$is_patched" -eq 1 ]; then
+        if [[ "$is_patched" -eq 1 ]]; then
             echo "    [i] session.upload_progress.enabled = On (Gepatcht; Deaktivierung empfohlen, falls ungenutzt)"
         else
             echo "    [!] session.upload_progress.enabled = On -> SICHERHEITSRISIKO bei ungepatchtem PHP!"
@@ -121,21 +125,21 @@ audit_php_hardening() {
         fi
     fi
 
-    if [ "$mem_limit" = "-1" ]; then
+    if [[ "$mem_limit" == "-1" ]]; then
         echo "    [+] memory_limit = -1 (PHP-OOM-Trigger blockiert)"
     else
         echo "    [i] memory_limit = $mem_limit (Advisory-Notfallwert: -1 via php_admin_value)"
-        if [ "$is_patched" -eq 0 ]; then
+        if [[ "$is_patched" -eq 0 ]]; then
             add_rec "[HÄRTUNG] Für ungepatchtes $target_desc 'memory_limit = -1' via php_admin_value setzen, um OOM-Abbrüche zu verhindern."
         fi
     fi
 
     echo "    [i] post_max_size = $post_max (Advisory: 8M ohne Uploads, 32M mit Uploads)"
 
-    if [ "$major_minor" = "8.5" ]; then
+    if [[ "$major_minor" == "8.5" ]]; then
         local fe_bt
         fe_bt=$($exec_cmd -r 'echo ini_get("fatal_error_backtraces");' 2>/dev/null || echo "1")
-        if [ "$fe_bt" = "0" ]; then
+        if [[ "$fe_bt" == "0" ]]; then
             echo "    [+] fatal_error_backtraces = 0 (CVE-2026-109619 Backtrace-Pfad blockiert)"
         else
             echo "    [!] fatal_error_backtraces = $fe_bt -> EMPFEHLUNG: Bei PHP 8.5 auf 0 setzen!"
@@ -150,19 +154,20 @@ check_php_patch() {
     local exec_cmd="${3:-php}"
     local bin_path="${4:-}"
     
-    local v=$(echo "$v_raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    local v
+    v=$(echo "$v_raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     
-    if [ -z "$v" ]; then
+    if [[ -z "$v" ]]; then
         log_warn "[$context] Konnte PHP-Version nicht eindeutig parsen ($v_raw)."
         return 0
     fi
 
-    local major_minor=$(echo "$v" | cut -d. -f1,2)
+    local major_minor
+    major_minor=$(echo "$v" | cut -d. -f1,2)
     local is_safe=0
     local is_sury_backport=0
 
-    # Whitelist-Prüfung für manuell ignorierte Versionen
-    if [ -n "$IGNORE_VERSIONS" ] && [[ " $IGNORE_VERSIONS " =~ [[:space:]]${major_minor}[[:space:]] ]]; then
+    if [[ -n "$IGNORE_VERSIONS" && " $IGNORE_VERSIONS " =~ [[:space:]]${major_minor}[[:space:]] ]]; then
         log_warn "[$context] PHP $v ist ungepatcht, aber via IGNORE_VERSIONS ignoriert (intern isoliert)."
         audit_php_hardening "$exec_cmd" "$major_minor" 0 "$context"
         return 0
@@ -174,7 +179,6 @@ check_php_patch() {
         8.4) version_ge "$v" "8.4.27" && is_safe=1 ;;
         8.5) version_ge "$v" "8.5.12" && is_safe=1 ;;
         7.4|8.0|8.1)
-            # EOL-Zweige: Prüfen, ob Sury-Sicherheitsbackport (Build >= 20261021) vorliegt
             if check_sury_backport "$v_raw" "$bin_path"; then
                 is_safe=1
                 is_sury_backport=1
@@ -187,8 +191,8 @@ check_php_patch() {
             ;;
     esac
 
-    if [ "$is_safe" -eq 1 ]; then
-        if [ "$is_sury_backport" -eq 1 ]; then
+    if [[ "$is_safe" -eq 1 ]]; then
+        if [[ "$is_sury_backport" -eq 1 ]]; then
             log_ok "[$context] PHP $v (EOL) ist via Sury Security-Backport (>= 20261021) GEFIXT."
         else
             log_ok "[$context] PHP $v ist GEFIXT gegen PHP2Shell."
@@ -212,11 +216,11 @@ fi
 
 # 2. Laufende FPM-Master-/Worker-Prozesse im RAM analysieren
 FPM_PIDS=$(pgrep -f "php-fpm: master process" 2>/dev/null || pgrep -f "php-fpm" 2>/dev/null || true)
-if [ -n "$FPM_PIDS" ]; then
+if [[ -n "$FPM_PIDS" ]]; then
     for pid in $FPM_PIDS; do
-        if [ -e "/proc/$pid/exe" ]; then
+        if [[ -e "/proc/$pid/exe" ]]; then
             EXE_PATH=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-            if [ -n "$EXE_PATH" ] && [ -x "$EXE_PATH" ]; then
+            if [[ -n "$EXE_PATH" && -x "$EXE_PATH" ]]; then
                 PROC_VER=$("$EXE_PATH" -v 2>/dev/null | head -n 2 || true)
                 check_php_patch "$PROC_VER" "Running Process PID $pid ($EXE_PATH)" "$EXE_PATH" "$EXE_PATH"
                 
@@ -230,12 +234,12 @@ if [ -n "$FPM_PIDS" ]; then
 fi
 
 # 3. Docker PHP Container prüfen
-if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
+if [[ "$HAS_PHP_DOCKER" -eq 1 ]]; then
     PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|wordpress)" || true)
     for c in $PHP_CONTAINERS; do
         if docker exec "$c" which php >/dev/null 2>&1; then
             C_PHP_VER=$(docker exec "$c" php -v 2>/dev/null | head -n 2 || true)
-            if [ -n "$C_PHP_VER" ]; then
+            if [[ -n "$C_PHP_VER" ]]; then
                 if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]" "docker exec $c php" ""; then
                     add_rec "[DOCKER UPDATE] Container [$c] aktualisieren: 'docker compose pull $c && docker compose up -d $c' bzw. './update.sh'."
                 fi
@@ -252,20 +256,20 @@ SESSION_DIRS="/var/lib/php/sessions"
 
 if command -v php >/dev/null 2>&1; then
     PHP_SESS_PATH=$(php -r 'echo ini_get("session.save_path");' 2>/dev/null || true)
-    [ -n "$PHP_SESS_PATH" ] && [ -d "$PHP_SESS_PATH" ] && SESSION_DIRS="$SESSION_DIRS $PHP_SESS_PATH"
+    [[ -n "$PHP_SESS_PATH" && -d "$PHP_SESS_PATH" ]] && SESSION_DIRS="$SESSION_DIRS $PHP_SESS_PATH"
 fi
 
-if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
+if [[ "$HAS_PHP_DOCKER" -eq 1 ]]; then
     DOCKER_SESS_VOLS=$(find /var/lib/docker/volumes -maxdepth 3 -type d -name "_data" 2>/dev/null | grep -E "(session|php)" || true)
     SESSION_DIRS="$SESSION_DIRS $DOCKER_SESS_VOLS"
 fi
 
 FOUND_SESS_INJ=0
 for sdir in $(echo "$SESSION_DIRS" | tr ' ' '\n' | sort -u); do
-    if [ -d "$sdir" ]; then
+    if [[ -d "$sdir" ]]; then
         SUSP=$(find "$sdir" -maxdepth 2 -type f \( -name "sess_*" -o -name "*.sess" \) \
             -exec grep -I -Erl "(<\?php|<\?=|[Oa]:[0-9]+:\"|upload_progress)" {} + 2>/dev/null || true)
-        if [ -n "$SUSP" ]; then
+        if [[ -n "$SUSP" ]]; then
             log_crit "Verdächtige Session-Injections in $sdir gefunden:"
             echo "$SUSP" | head -n 10
             FOUND_SESS_INJ=1
@@ -277,7 +281,7 @@ done
 for tdir in /tmp /var/tmp; do
     SUSP_TMP=$(find "$tdir" -maxdepth 1 -type f -name "sess_*" \
         -exec grep -I -Erl "(<\?php|<\?=|[Oa]:[0-9]+:\"|upload_progress)" {} + 2>/dev/null || true)
-    if [ -n "$SUSP_TMP" ]; then
+    if [[ -n "$SUSP_TMP" ]]; then
         log_crit "Verdächtige PHP-Session-Injections in $tdir/sess_* gefunden:"
         echo "$SUSP_TMP" | head -n 10
         FOUND_SESS_INJ=1
@@ -285,7 +289,7 @@ for tdir in /tmp /var/tmp; do
     fi
 done
 
-[ "$FOUND_SESS_INJ" -eq 0 ] && log_ok "Keine PHP-Tags oder Exploit-Payloads in Sessions gefunden."
+[[ "$FOUND_SESS_INJ" -eq 0 ]] && log_ok "Keine PHP-Tags oder Exploit-Payloads in Sessions gefunden."
 
 # ==============================================================================
 # 2. Dateisystem-Prüfung (Web-Roots & Temp-Executables)
@@ -293,15 +297,15 @@ done
 echo -e "\n[*] 2. Dateisystem-Prüfung auf modifizierte PHP-Dateien & Executables..."
 SEARCH_ROOTS=""
 for p in /var/www /home /var/piler/www /opt/mailcow-dockerized/data/web; do
-    [ -d "$p" ] && SEARCH_ROOTS="$SEARCH_ROOTS $p"
+    [[ -d "$p" ]] && SEARCH_ROOTS="$SEARCH_ROOTS $p"
 done
 
-if [ -n "$SEARCH_ROOTS" ]; then
+if [[ -n "$SEARCH_ROOTS" ]]; then
     RECENT_PHP=$(find $SEARCH_ROOTS -maxdepth 6 \
-        \( -type d \( -name "store" -o -name "cache" -o -name "apps" -o -name "wflogs" -o -name "languages" \) -prune \) -o \
+        \( -type d \( -name "store" -o -name "cache" -o -name "apps" -o -name "wflogs" -o -name "languages" -o -name "climulti" \) -prune \) -o \
         \( -type f \( -name "*.php" -o -name "*.phtml" -o -name "*.phar" \) ! -name "*.l10n.php" -mtime -$SCAN_DAYS -print \) 2>/dev/null || true)
     
-    if [ -n "$RECENT_PHP" ]; then
+    if [[ -n "$RECENT_PHP" ]]; then
         log_warn "Kürzlich geänderte PHP-Dateien außerhalb von Caches/Apps (letzte $SCAN_DAYS Tage):"
         echo "$RECENT_PHP" | head -n 15
         add_rec "[AUDIT] Modifizierte PHP-Dateien sichten. (Hinweis auf False Positive: Bei CMS-Updates, Git-Pulls oder Plugin-Aktivierungen völlig normal)."
@@ -313,7 +317,7 @@ fi
 SUSP_BINARIES=$(find /tmp /dev/shm /var/tmp -maxdepth 3 -type f \( -perm -111 -o -name "*.so" -o -name "*.sh" -o -name "*.py" -o -name "*.pl" \) 2>/dev/null | \
     grep -Ev "(systemd-private|tmp\.[A-Za-z0-9]+|\.mount_|coolwsd|appimage_extracted|/tmp/oscap\.|/tmp/apt-key-gpghome\.)" || true)
 
-if [ -n "$SUSP_BINARIES" ]; then
+if [[ -n "$SUSP_BINARIES" ]]; then
     log_crit "Unerwartete Binaries/Skripte in flüchtigen Pfaden entdeckt:"
     echo "$SUSP_BINARIES" | head -n 15
     add_rec "[ALARM] Unbekannte Binaries/Skripte in flüchtigen Pfaden gefunden. Manuelle Prüfung mit: 'file <Pfad>' und 'ls -lu <Pfad>'."
@@ -333,7 +337,7 @@ SUSP_PROCS=$(ps -eo user,pid,ppid,args 2>/dev/null | \
     grep -Ev "(olefy\.py|whitelist_forwardinghosts\.sh|notify_push|coolwsd|Collabora|\.mount_|appimage_extracted)" | \
     grep -Ev "(admin/cli/cron\.php|wp-cron\.php|occ|artisan|bin/console)" || true)
 
-if [ -n "$SUSP_PROCS" ]; then
+if [[ -n "$SUSP_PROCS" ]]; then
     log_crit "Verdächtige interaktive Shells oder Downloader unter Web-Usern aktiv:"
     echo "$SUSP_PROCS"
     add_rec "[ALARM] Aktive interaktive Shells unter Web-Usern gefunden! Sofort Prozessbaum mit 'ps auxf' prüfen und verdächtige PIDs beenden."
@@ -347,20 +351,20 @@ fi
 # ==============================================================================
 echo -e "\n[*] 4. Analyse von Access- & Error-Logs..."
 LOG_DIRS=""
-[ -d "/var/log" ] && LOG_DIRS="/var/log"
+[[ -d "/var/log" ]] && LOG_DIRS="/var/log"
 
-if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
+if [[ "$HAS_PHP_DOCKER" -eq 1 ]]; then
     MC_VOL=$(find /var/lib/docker/volumes -maxdepth 3 -type d -name "_data" 2>/dev/null | grep "nginx-log-vol-1" | head -n 1 || true)
-    [ -n "$MC_VOL" ] && LOG_DIRS="$LOG_DIRS $MC_VOL"
+    [[ -n "$MC_VOL" ]] && LOG_DIRS="$LOG_DIRS $MC_VOL"
 fi
 
 RECENT_LOGS=$(find $LOG_DIRS -maxdepth 3 -type f \( -name "*access*.log" -o -name "*error*.log" -o -name "nextcloud.log" \) -mtime -7 2>/dev/null || true)
 
-if [ -n "$RECENT_LOGS" ]; then
+if [[ -n "$RECENT_LOGS" ]]; then
     CRASH_LOGS=$(grep -Ei "(allowed memory size.*exhausted|child.*terminated on signal|segmentation fault)" $RECENT_LOGS 2>/dev/null | \
         grep -Ei "(Oct|Okt|2026-10)" | tail -n 10 || true)
 
-    if [ -n "$CRASH_LOGS" ]; then
+    if [[ -n "$CRASH_LOGS" ]]; then
         log_warn "Aktuelle Crash- oder Memory-Exhaustion-Spuren (Oktober 2026):"
         echo "$CRASH_LOGS"
         add_rec "[LOG-AUDIT] FPM-Crashes oder OOM-Meldungen untersuchen. (Hinweis auf False Positive: Reguläre OOM-Events durch ressourcenintensive PHP-Exporte oder Gallery-Rendering)."
@@ -369,14 +373,15 @@ if [ -n "$RECENT_LOGS" ]; then
     fi
 
     HIGH_POST_IPS=$(grep -h "POST " $RECENT_LOGS 2>/dev/null | \
+        grep -Ev "(matomo\.php|piwik\.php|wp-cron\.php)" | \
         awk '$7 ~ /\.php/ {print $1}' | \
-        sort | uniq -c | awk '$1 > 300 {print $1 " Anfragen von IP: " $2}' || true)
+        sort | uniq -c | awk '$1 > 2500 {print $1 " Anfragen von IP: " $2}' || true)
 
-    if [ -n "$HIGH_POST_IPS" ]; then
-        log_crit "Potenzieller Brute-Force / Exploit-Scan entdeckt (>300 POSTs auf .php):"
+    if [[ -n "$HIGH_POST_IPS" ]]; then
+        log_crit "Potenzieller Brute-Force / Exploit-Scan entdeckt (>2500 POSTs auf .php):"
         echo "$HIGH_POST_IPS"
         add_rec "[FIREWALL] IPs mit extremen POST-Raten auf PHP-Dateien temporär via Fail2ban oder Firewall/OPNsense blockieren."
-        add_rec "           (Hinweis auf False Positive: Webhooks, Synchronisations-Clients oder API-Polls)."
+        add_rec "           (Hinweis auf False Positive: Webhooks, Synchronisations-Clients, Matomo oder API-Polls)."
     else
         log_ok "Keine auffälligen POST-Anfragefluten auf PHP-Endpunkte verzeichnet."
     fi
@@ -387,7 +392,7 @@ fi
 # ==============================================================================
 # 5. Docker Container Diff (RootFS-Prüfung)
 # ==============================================================================
-if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
+if [[ "$HAS_PHP_DOCKER" -eq 1 ]]; then
     echo -e "\n[*] 5. Docker Container Rootfs Diffs..."
     PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|mariadb)" || true)
     
@@ -397,7 +402,7 @@ if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
             grep -Ev "(supervisor.*\.log|healthcheck_status|mailcowauth|redis-conf\.sh|source_env\.sh|init_db\.inc\.php|cjson\.so|optimize-fts\.sh|imapsync_runner\.pl|maildir_gc\.sh|postdrop|postqueue|postlog|libpostfix|\.css$|\.js$|uid_[0-9]+|/run/s6/|\.lock$|iam-sync)" | \
             head -n 5 || true)
             
-        if [ -n "$DIFF_CHECK" ]; then
+        if [[ -n "$DIFF_CHECK" ]]; then
             log_crit "Verdächtige RootFS-Änderungen in Container [$c]:"
             echo "$DIFF_CHECK"
             add_rec "[DOCKER FORENSIK] Rootfs-Änderungen in [$c] prüfen. (Hinweis auf False Positive: Container-eigene Locking-Files, Run-Pipes oder nachträglich installierte Tools)."
@@ -411,7 +416,7 @@ fi
 echo -e "\n------------------------------------------------------------"
 echo "=== ZUSAMMENFASSUNG & HANDLUNGSEMPFEHLUNGEN ==="
 
-if [ ${#RECOMMENDATIONS[@]} -eq 0 ]; then
+if [[ ${#RECOMMENDATIONS[@]} -eq 0 ]]; then
     echo "[+] Keine Maßnahmen erforderlich: Alle Systeme sind gepatcht, Dienste laufen aktuell und keine verdächtigen Spuren gefunden."
 else
     for rec in "${RECOMMENDATIONS[@]}"; do
@@ -420,7 +425,7 @@ else
 fi
 
 echo "------------------------------------------------------------"
-if [ "$ALERT_FOUND" -ne 0 ]; then
+if [[ "$ALERT_FOUND" -ne 0 ]]; then
     echo "STATUS: CRITICAL - Handlungsbedarf bei Versionen, Neustarts oder verdächtigen Artefakten!"
     exit 1
 else

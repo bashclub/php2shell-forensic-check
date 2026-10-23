@@ -72,7 +72,7 @@ Um "Alert Fatigue" in Monitoring-Dashboards zu verhindern, enthält der Scanner 
 
 ```bash
 # Herunterladen und Ausführungsrechte vergeben
-curl -fsSL [https://raw.githubusercontent.com/dein-repo/php2shell-forensic-check/main/php2shell-forensic-check](https://raw.githubusercontent.com/dein-repo/php2shell-forensic-check/main/php2shell-forensic-check) -o php2shell-forensic-check
+curl -fsSL https://code.bashclub.org/bashclub/php2shell-forensic-check/raw/branch/main/php2shell-forensic-check -o php2shell-forensic-check
 chmod +x php2shell-forensic-check
 
 # Direkt ausführen (Root-Rechte erforderlich)

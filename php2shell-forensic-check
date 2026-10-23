@@ -2,7 +2,8 @@
 # ==============================================================================
 # Tactical RMM Script: Forensic Check, Patch Auditor & Actionable Hardening
 # PHP2Shell (CVE-2026-109618 / 109619)
-# Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Plesk, Moodle, Matomo
+# Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Plesk, Moodle,
+#                      Matomo, EGroupware (Alpine/BusyBox & Host Cgroup Tracking)
 # Supports: Upstream Releases (8.2-8.5) & Sury Backports (7.4, 8.0, 8.1 >= 20261021)
 # ==============================================================================
 
@@ -38,7 +39,7 @@ if command -v php >/dev/null 2>&1 || pgrep -f "php-fpm" >/dev/null 2>&1; then
 fi
 
 if command -v docker >/dev/null 2>&1; then
-    if docker ps --format "{{.Image}} {{.Names}}" 2>/dev/null | grep -Ei "(php|mailcow|nextcloud|sogo|wordpress)" >/dev/null 2>&1; then
+    if docker ps -q 2>/dev/null | grep -q .; then
         HAS_PHP_DOCKER=1
     fi
 fi
@@ -55,8 +56,29 @@ fi
 # ==============================================================================
 echo -e "\n[*] 0b. Prüfung von PHP-Patchstand, laufenden Prozessen & Härtung..."
 
-version_ge() {
-    printf '%s\n%s' "$2" "$1" | sort -C -V
+# Semantischer Versionsvergleich ohne GNU sort / BusyBox Abhängigkeit
+is_version_ge() {
+    local v="$1"
+    local target="$2"
+
+    local v_maj v_min v_patch
+    local t_maj t_min t_patch
+
+    v_maj=$(echo "$v" | cut -d. -f1)
+    v_min=$(echo "$v" | cut -d. -f2)
+    v_patch=$(echo "$v" | cut -d. -f3 | grep -oE '^[0-9]+' || echo "0")
+
+    t_maj=$(echo "$target" | cut -d. -f1)
+    t_min=$(echo "$target" | cut -d. -f2)
+    t_patch=$(echo "$target" | cut -d. -f3 | grep -oE '^[0-9]+' || echo "0")
+
+    if (( v_maj > t_maj )); then return 0; fi
+    if (( v_maj < t_maj )); then return 1; fi
+    if (( v_min > t_min )); then return 0; fi
+    if (( v_min < t_min )); then return 1; fi
+    if (( v_patch >= t_patch )); then return 0; fi
+
+    return 1
 }
 
 check_sury_backport() {
@@ -174,10 +196,10 @@ check_php_patch() {
     fi
 
     case "$major_minor" in
-        8.2) version_ge "$v" "8.2.35" && is_safe=1 ;;
-        8.3) version_ge "$v" "8.3.36" && is_safe=1 ;;
-        8.4) version_ge "$v" "8.4.27" && is_safe=1 ;;
-        8.5) version_ge "$v" "8.5.12" && is_safe=1 ;;
+        8.2) is_version_ge "$v" "8.2.35" && is_safe=1 ;;
+        8.3) is_version_ge "$v" "8.3.36" && is_safe=1 ;;
+        8.4) is_version_ge "$v" "8.4.27" && is_safe=1 ;;
+        8.5) is_version_ge "$v" "8.5.12" && is_safe=1 ;;
         7.4|8.0|8.1)
             if check_sury_backport "$v_raw" "$bin_path"; then
                 is_safe=1
@@ -214,10 +236,15 @@ if command -v php >/dev/null 2>&1; then
     check_php_patch "$HOST_PHP_VER" "Host CLI Binary" "php" "$HOST_BIN"
 fi
 
-# 2. Laufende FPM-Master-/Worker-Prozesse im RAM analysieren
+# 2. Laufende FPM-Master-/Worker-Prozesse auf dem Host im RAM analysieren
 FPM_PIDS=$(pgrep -f "php-fpm: master process" 2>/dev/null || pgrep -f "php-fpm" 2>/dev/null || true)
 if [[ -n "$FPM_PIDS" ]]; then
     for pid in $FPM_PIDS; do
+        # Nur echte Host-Prozesse auditieren (Prozesse in Docker-Containern werden in Schritt 3 geprüft)
+        if [[ -r "/proc/$pid/cgroup" ]] && grep -qE '[0-9a-f]{64}' "/proc/$pid/cgroup" 2>/dev/null; then
+            continue
+        fi
+
         if [[ -e "/proc/$pid/exe" ]]; then
             EXE_PATH=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
             if [[ -n "$EXE_PATH" && -x "$EXE_PATH" ]]; then
@@ -233,15 +260,29 @@ if [[ -n "$FPM_PIDS" ]]; then
     done
 fi
 
-# 3. Docker PHP Container prüfen
+# 3. Docker PHP Container generisch ermitteln und prüfen
 if [[ "$HAS_PHP_DOCKER" -eq 1 ]]; then
-    PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|wordpress)" || true)
-    for c in $PHP_CONTAINERS; do
+    # Dynamische Zuordnung: Laufende PHP-Prozess-PIDs auf dem Host über /proc/<pid>/cgroup zu Docker auflösen
+    CGROUP_CONTAINERS=$(
+        for pid in $(pgrep -f "(php-fpm|php)" 2>/dev/null || true); do
+            grep -oE '[0-9a-f]{64}' "/proc/$pid/cgroup" 2>/dev/null
+        done | sort -u | while read -r cid; do
+            docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's/^\///'
+        done
+    )
+
+    # Standard-Namensfilter als Fallback ergänzen
+    NAMED_CONTAINERS=$(docker ps --format "{{.Names}}" 2>/dev/null | grep -E "(php|web|mailcow|nextcloud|sogo|wordpress|egroupware)" || true)
+
+    # Vereinigen & Duplikate entfernen
+    DETECTED_CONTAINERS=$(printf "%s\n%s\n" "$CGROUP_CONTAINERS" "$NAMED_CONTAINERS" | grep -v '^$' | sort -u || true)
+
+    for c in $DETECTED_CONTAINERS; do
         if docker exec "$c" which php >/dev/null 2>&1; then
             C_PHP_VER=$(docker exec "$c" php -v 2>/dev/null | head -n 2 || true)
             if [[ -n "$C_PHP_VER" ]]; then
                 if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]" "docker exec $c php" ""; then
-                    add_rec "[DOCKER UPDATE] Container [$c] aktualisieren: 'docker compose pull $c && docker compose up -d $c' bzw. './update.sh'."
+                    add_rec "[DOCKER UPDATE] Container [$c] aktualisieren: 'docker compose pull $c && docker compose up -d $c' bzw. Image aktualisieren."
                 fi
             fi
         fi
@@ -249,7 +290,7 @@ if [[ "$HAS_PHP_DOCKER" -eq 1 ]]; then
 fi
 
 # ==============================================================================
-# 1. Session Storage & Injection Scan (Nur echte PHP-Session-Dateien)
+# 1. Session Storage & Injection Scan (Nur echte PHP-Code Tags)
 # ==============================================================================
 echo -e "\n[*] 1. Session Storage Scan..."
 SESSION_DIRS="/var/lib/php/sessions"
@@ -267,8 +308,9 @@ fi
 FOUND_SESS_INJ=0
 for sdir in $(echo "$SESSION_DIRS" | tr ' ' '\n' | sort -u); do
     if [[ -d "$sdir" ]]; then
+        # Nur nach echten PHP-Tags und upload_progress Exploit-Mustern suchen (Objekt-Serialisierungen wie O: oder a: sind normal)
         SUSP=$(find "$sdir" -maxdepth 2 -type f \( -name "sess_*" -o -name "*.sess" \) \
-            -exec grep -I -Erl "(<\?php|<\?=|[Oa]:[0-9]+:\"|upload_progress)" {} + 2>/dev/null || true)
+            -exec grep -I -Erl "(<\?php|<\?=)" {} + 2>/dev/null || true)
         if [[ -n "$SUSP" ]]; then
             log_crit "Verdächtige Session-Injections in $sdir gefunden:"
             echo "$SUSP" | head -n 10
@@ -280,7 +322,7 @@ done
 
 for tdir in /tmp /var/tmp; do
     SUSP_TMP=$(find "$tdir" -maxdepth 1 -type f -name "sess_*" \
-        -exec grep -I -Erl "(<\?php|<\?=|[Oa]:[0-9]+:\"|upload_progress)" {} + 2>/dev/null || true)
+        -exec grep -I -Erl "(<\?php|<\?=)" {} + 2>/dev/null || true)
     if [[ -n "$SUSP_TMP" ]]; then
         log_crit "Verdächtige PHP-Session-Injections in $tdir/sess_* gefunden:"
         echo "$SUSP_TMP" | head -n 10
@@ -394,9 +436,7 @@ fi
 # ==============================================================================
 if [[ "$HAS_PHP_DOCKER" -eq 1 ]]; then
     echo -e "\n[*] 5. Docker Container Rootfs Diffs..."
-    PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|mariadb)" || true)
-    
-    for c in $PHP_CONTAINERS; do
+    for c in $DETECTED_CONTAINERS; do
         DIFF_CHECK=$(docker diff "$c" 2>/dev/null | \
             grep -E "^[AC] .*(bin/|tmp/|shm/|\.php$|\.sh$|\.so$)" | \
             grep -Ev "(supervisor.*\.log|healthcheck_status|mailcowauth|redis-conf\.sh|source_env\.sh|init_db\.inc\.php|cjson\.so|optimize-fts\.sh|imapsync_runner\.pl|maildir_gc\.sh|postdrop|postqueue|postlog|libpostfix|\.css$|\.js$|uid_[0-9]+|/run/s6/|\.lock$|iam-sync)" | \

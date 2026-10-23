@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Tactical RMM Script: Forensic Check & Patch Auditor - PHP2Shell (CVE-2026-109618 / 109619)
+# Tactical RMM Script: Forensic Check, Patch Auditor & Actionable Hardening
+# PHP2Shell (CVE-2026-109618 / 109619)
 # Multi-Host hardened: Nextcloud, WordPress, Mailcow, ISPConfig, Plesk, Moodle
 # ==============================================================================
 
@@ -12,7 +13,15 @@ SCAN_DAYS=5
 # Liste ignorierter Versionen für intern isolierte Stacks (z. B. CloudPanel PHP 8.1)
 IGNORE_VERSIONS="${IGNORE_VERSIONS:-8.1}"
 
+# Puffer für das Abschluss-Audit
+RECOMMENDATIONS=()
+
+add_rec() {
+    RECOMMENDATIONS+=("$1")
+}
+
 log_ok() { echo "[OK] $1"; }
+log_info() { echo "[INFO] $1"; }
 log_warn() { echo "[WARN] $1"; }
 log_crit() { echo "[CRITICAL] $1"; ALERT_FOUND=1; }
 
@@ -44,17 +53,68 @@ if [ "$HAS_PHP_HOST" -eq 0 ] && [ "$HAS_PHP_DOCKER" -eq 0 ]; then
 fi
 
 # ==============================================================================
-# 0b. PHP Patch-Level & In-Memory Process Audit
+# 0b. PHP Patch-Level, Prozess-Audit & Härtungs-Check
 # ==============================================================================
-echo -e "\n[*] 0b. Prüfung von PHP-Patchstand und laufenden FPM-Prozessen..."
+echo -e "\n[*] 0b. Prüfung von PHP-Patchstand, laufenden Prozessen & Härtung..."
 
 version_ge() {
     printf '%s\n%s' "$2" "$1" | sort -C -V
 }
 
+audit_php_hardening() {
+    local exec_cmd="$1"
+    local major_minor="$2"
+    local is_patched="$3"
+    local target_desc="$4"
+
+    local up_enabled
+    local mem_limit
+    local post_max
+
+    up_enabled=$($exec_cmd -r 'echo ini_get("session.upload_progress.enabled");' 2>/dev/null || echo "1")
+    mem_limit=$($exec_cmd -r 'echo ini_get("memory_limit");' 2>/dev/null || echo "unknown")
+    post_max=$($exec_cmd -r 'echo ini_get("post_max_size");' 2>/dev/null || echo "unknown")
+
+    echo "    --- Aktive Härtungswerte (${major_minor}) ---"
+    
+    if [ "$up_enabled" = "0" ] || [ "$up_enabled" = "" ]; then
+        echo "    [+] session.upload_progress.enabled = Off (CVE-2026-109619 Pfad blockiert)"
+    else
+        if [ "$is_patched" -eq 1 ]; then
+            echo "    [i] session.upload_progress.enabled = On (Gepatcht; Deaktivierung empfohlen, falls ungenutzt)"
+        else
+            echo "    [!] session.upload_progress.enabled = On -> SICHERHEITSRISIKO bei ungepatchtem PHP!"
+            add_rec "[HÄRTUNG] In der php.ini von $target_desc 'session.upload_progress.enabled = 0' setzen und Dienst neu starten."
+        fi
+    fi
+
+    if [ "$mem_limit" = "-1" ]; then
+        echo "    [+] memory_limit = -1 (PHP-OOM-Trigger blockiert)"
+    else
+        echo "    [i] memory_limit = $mem_limit (Advisory-Notfallwert: -1 via php_admin_value)"
+        if [ "$is_patched" -eq 0 ]; then
+            add_rec "[HÄRTUNG] Für ungepatchtes $target_desc 'memory_limit = -1' via php_admin_value setzen, um OOM-Abbrüche zu verhindern."
+        fi
+    fi
+
+    echo "    [i] post_max_size = $post_max (Advisory: 8M ohne Uploads, 32M mit Uploads)"
+
+    if [ "$major_minor" = "8.5" ]; then
+        local fe_bt
+        fe_bt=$($exec_cmd -r 'echo ini_get("fatal_error_backtraces");' 2>/dev/null || echo "1")
+        if [ "$fe_bt" = "0" ]; then
+            echo "    [+] fatal_error_backtraces = 0 (CVE-2026-109619 Backtrace-Pfad blockiert)"
+        else
+            echo "    [!] fatal_error_backtraces = $fe_bt -> EMPFEHLUNG: Bei PHP 8.5 auf 0 setzen!"
+            add_rec "[HÄRTUNG] In der php.ini von $target_desc 'fatal_error_backtraces = 0' eintragen."
+        fi
+    fi
+}
+
 check_php_patch() {
     local v_raw="$1"
     local context="$2"
+    local exec_cmd="${3:-php}"
     
     local v=$(echo "$v_raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     
@@ -66,9 +126,9 @@ check_php_patch() {
     local major_minor=$(echo "$v" | cut -d. -f1,2)
     local is_safe=0
 
-    # Whitelist-Prüfung für isolierte Versionen (z. B. CloudPanel 8.1)
     if [[ " $IGNORE_VERSIONS " =~ [[:space:]]${major_minor}[[:space:]] ]]; then
         log_warn "[$context] PHP $v ist ungepatcht, aber via IGNORE_VERSIONS ignoriert (intern isoliert)."
+        audit_php_hardening "$exec_cmd" "$major_minor" 0 "$context"
         return 0
     fi
 
@@ -84,9 +144,12 @@ check_php_patch() {
 
     if [ "$is_safe" -eq 1 ]; then
         log_ok "[$context] PHP $v ist GEFIXT gegen PHP2Shell."
+        audit_php_hardening "$exec_cmd" "$major_minor" 1 "$context"
         return 0
     else
         log_crit "[$context] PHP $v ist UNGEPATCHT und angreifbar!"
+        audit_php_hardening "$exec_cmd" "$major_minor" 0 "$context"
+        add_rec "[UPDATE] $context: PHP-Paket umgehend aktualisieren (Ziel: 8.2.35+, 8.3.36+, 8.4.27+, 8.5.12+)."
         return 1
     fi
 }
@@ -94,7 +157,7 @@ check_php_patch() {
 # 1. Host PHP CLI & Binaries prüfen
 if command -v php >/dev/null 2>&1; then
     HOST_PHP_VER=$(php -r 'echo PHP_VERSION;' 2>/dev/null || php -v | head -n1)
-    check_php_patch "$HOST_PHP_VER" "Host CLI Binary"
+    check_php_patch "$HOST_PHP_VER" "Host CLI Binary" "php"
 fi
 
 # 2. Laufende FPM-Master-/Worker-Prozesse im RAM analysieren
@@ -105,26 +168,26 @@ if [ -n "$FPM_PIDS" ]; then
             EXE_PATH=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
             if [ -n "$EXE_PATH" ] && [ -x "$EXE_PATH" ]; then
                 PROC_VER=$("$EXE_PATH" -v 2>/dev/null | head -n 1 || true)
-                check_php_patch "$PROC_VER" "Running Process PID $pid ($EXE_PATH)"
+                check_php_patch "$PROC_VER" "Running Process PID $pid ($EXE_PATH)" "$EXE_PATH"
                 
                 if readlink "/proc/$pid/exe" | grep -q "(deleted)"; then
                     log_crit "NEUSTART ERFORDERLICH: FPM-Prozess $pid läuft noch mit alter Binary im RAM!"
-                    echo "    -> Empfehlung: systemctl restart php*-fpm"
+                    add_rec "[NEUSTART] FPM-Dienst neu starten, um aktualisierte Binaries auszuführen: 'systemctl restart php*-fpm'"
                 fi
             fi
         fi
     done
 fi
 
-# 3. Docker PHP Container prüfen (überspringt Container ohne PHP geräuschlos)
+# 3. Docker PHP Container prüfen
 if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
     PHP_CONTAINERS=$(docker ps --format "{{.Names}}" | grep -E "(php|web|mailcow|nextcloud|sogo|wordpress)" || true)
     for c in $PHP_CONTAINERS; do
         if docker exec "$c" which php >/dev/null 2>&1; then
             C_PHP_VER=$(docker exec "$c" php -r 'echo PHP_VERSION;' 2>/dev/null || true)
             if [ -n "$C_PHP_VER" ]; then
-                if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]"; then
-                    echo "    -> Empfehlung für [$c]: Image neu pullen und Container neu erstellen (z. B. ./update.sh oder docker compose pull)."
+                if ! check_php_patch "$C_PHP_VER" "Docker Container [$c]" "docker exec $c php"; then
+                    add_rec "[DOCKER UPDATE] Container [$c] aktualisieren: 'docker compose pull $c && docker compose up -d $c' bzw. './update.sh'."
                 fi
             fi
         fi
@@ -156,6 +219,7 @@ for sdir in $(echo "$SESSION_DIRS" | tr ' ' '\n' | sort -u); do
             log_crit "Verdächtige Session-Injections in $sdir gefunden:"
             echo "$SUSP" | head -n 10
             FOUND_SESS_INJ=1
+            add_rec "[FORENSIK] Betroffene Sessions manuell isolieren/prüfen: $SUSP (Kopieren nach /root/forensics vor dem Löschen)."
         fi
     fi
 done
@@ -167,6 +231,7 @@ for tdir in /tmp /var/tmp; do
         log_crit "Verdächtige PHP-Session-Injections in $tdir/sess_* gefunden:"
         echo "$SUSP_TMP" | head -n 10
         FOUND_SESS_INJ=1
+        add_rec "[FORENSIK] Session-Injections in $tdir/sess_* analysieren und entfernen."
     fi
 done
 
@@ -189,6 +254,7 @@ if [ -n "$SEARCH_ROOTS" ]; then
     if [ -n "$RECENT_PHP" ]; then
         log_warn "Kürzlich geänderte PHP-Dateien außerhalb von Caches/Apps (letzte $SCAN_DAYS Tage):"
         echo "$RECENT_PHP" | head -n 15
+        add_rec "[AUDIT] Modifizierte PHP-Dateien sichten. (Hinweis auf False Positive: Bei CMS-Updates, Git-Pulls oder Plugin-Aktivierungen völlig normal)."
     else
         log_ok "Keine auffällig modifizierten PHP-Dateien in Web-Roots."
     fi
@@ -201,6 +267,8 @@ SUSP_BINARIES=$(find /tmp /dev/shm /var/tmp -maxdepth 3 -type f \( -perm -111 -o
 if [ -n "$SUSP_BINARIES" ]; then
     log_crit "Unerwartete Binaries/Skripte in flüchtigen Pfaden entdeckt:"
     echo "$SUSP_BINARIES" | head -n 15
+    add_rec "[ALARM] Unbekannte Binaries/Skripte in flüchtigen Pfaden gefunden. Manuelle Prüfung mit: 'file <Pfad>' und 'ls -lu <Pfad>'."
+    add_rec "        (Hinweis auf False Positive: Temporäre Build-Tools, Cron-Wrapper oder Paketmanager-Instanzen, die nicht im Whitelist-Filter erfasst sind)."
 else
     log_ok "Keine verdächtigen Executables in /tmp oder /dev/shm."
 fi
@@ -209,7 +277,6 @@ fi
 # 3. Prozessbaum-Prüfung (Web-User Subprozesse)
 # ==============================================================================
 echo -e "\n[*] 3. Prozessbaum-Prüfung (Web-User Subprozesse)..."
-# Whitelist: olefy, Forwarding-Script, Nextcloud Push, Collabora, Moodle/WP CLI-Cronjobs
 SUSP_PROCS=$(ps -eo user,pid,ppid,args 2>/dev/null | \
     grep -E "^(www-data|nginx|nobody|web[0-9]+|clp|psacln|psaserv)\s+" | \
     grep -E "(curl|wget|nc|ncat|netcat|socat|/bin/sh|/bin/bash|/bin/dash)" | \
@@ -220,6 +287,8 @@ SUSP_PROCS=$(ps -eo user,pid,ppid,args 2>/dev/null | \
 if [ -n "$SUSP_PROCS" ]; then
     log_crit "Verdächtige interaktive Shells oder Downloader unter Web-Usern aktiv:"
     echo "$SUSP_PROCS"
+    add_rec "[ALARM] Aktive interaktive Shells unter Web-Usern gefunden! Sofort Prozessbaum mit 'ps auxf' prüfen und verdächtige PIDs beenden."
+    add_rec "        (Hinweis auf False Positive: Neu eingerichtete CLI-Wartungsskripte, Cronjobs oder Deployment-Hooks, die Shells aufrufen)."
 else
     log_ok "Keine verdächtigen interaktiven Shells unter Web-Usern."
 fi
@@ -245,6 +314,7 @@ if [ -n "$RECENT_LOGS" ]; then
     if [ -n "$CRASH_LOGS" ]; then
         log_warn "Aktuelle Crash- oder Memory-Exhaustion-Spuren (Oktober 2026):"
         echo "$CRASH_LOGS"
+        add_rec "[LOG-AUDIT] FPM-Crashes oder OOM-Meldungen untersuchen. (Hinweis auf False Positive: Reguläre OOM-Events durch ressourcenintensive PHP-Exporte oder Gallery-Rendering)."
     else
         log_ok "Keine aktuellen FPM-Worker-Crashes oder OOM-Meldungen."
     fi
@@ -256,6 +326,8 @@ if [ -n "$RECENT_LOGS" ]; then
     if [ -n "$HIGH_POST_IPS" ]; then
         log_crit "Potenzieller Brute-Force / Exploit-Scan entdeckt (>300 POSTs auf .php):"
         echo "$HIGH_POST_IPS"
+        add_rec "[FIREWALL] IPs mit extremen POST-Raten auf PHP-Dateien temporär via Fail2ban oder Firewall/OPNsense blockieren."
+        add_rec "           (Hinweis auf False Positive: Webhooks, Synchronisations-Clients oder API-Polls)."
     else
         log_ok "Keine auffälligen POST-Anfragefluten auf PHP-Endpunkte verzeichnet."
     fi
@@ -279,18 +351,30 @@ if [ "$HAS_PHP_DOCKER" -eq 1 ]; then
         if [ -n "$DIFF_CHECK" ]; then
             log_crit "Verdächtige RootFS-Änderungen in Container [$c]:"
             echo "$DIFF_CHECK"
+            add_rec "[DOCKER FORENSIK] Rootfs-Änderungen in [$c] prüfen. (Hinweis auf False Positive: Container-eigene Locking-Files, Run-Pipes oder nachträglich installierte Tools)."
         fi
     done
 fi
 
 # ==============================================================================
-# Tactical RMM Exit Code Handling
+# 6. Strukturierte Handlungsempfehlungen & Status-Ausgabe
 # ==============================================================================
 echo -e "\n------------------------------------------------------------"
+echo "=== ZUSAMMENFASSUNG & HANDLUNGSEMPFEHLUNGEN ==="
+
+if [ ${#RECOMMENDATIONS[@]} -eq 0 ]; then
+    echo "[+] Keine Maßnahmen erforderlich: Alle Systeme sind gepatcht, Dienste laufen aktuell und keine verdächtigen Spuren gefunden."
+else
+    for rec in "${RECOMMENDATIONS[@]}"; do
+        echo " -> $rec"
+    done
+fi
+
+echo "------------------------------------------------------------"
 if [ "$ALERT_FOUND" -ne 0 ]; then
-    echo "STATUS: CRITICAL - Ungepatchte Versionen, fehlende Neustarts oder verdächtige Artefakte gefunden!"
+    echo "STATUS: CRITICAL - Handlungsbedarf bei Versionen, Neustarts oder verdächtigen Artefakten!"
     exit 1
 else
-    echo "STATUS: OK - Alle PHP-Instanzen gepatcht und keine Exploit-Spuren gefunden."
+    echo "STATUS: OK - Keine akuten Indikatoren für PHP2Shell gefunden."
     exit 0
 fi
